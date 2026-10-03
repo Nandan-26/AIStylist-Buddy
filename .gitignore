@@ -1,0 +1,21 @@
+.streamlit/secrets.toml
+
+# Python environment and cache
+.venv/
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Local database and generated files
+aistylist.db
+demo_cache/
+
+# User uploads and generated images
+uploads/*
+
+# Generated documents and archives
+*.pdf
+*.zip

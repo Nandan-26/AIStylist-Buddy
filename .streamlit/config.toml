@@ -1,0 +1,9 @@
+# Put this file at .streamlit/config.toml next to app.py.
+# It keeps Streamlit's own widgets light even if your OS is in dark mode.
+[theme]
+base = "light"
+primaryColor = "#6a4630"
+backgroundColor = "#f4ecdf"
+secondaryBackgroundColor = "#ebdfcb"
+textColor = "#151311"
+font = "sans serif"
