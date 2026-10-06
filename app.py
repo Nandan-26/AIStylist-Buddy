@@ -271,6 +271,12 @@ def tile_html(colors, caption="", images=None, height=210):
 
 
 # ------------------- Web photos -------------------
+# When True, recommendations ignore past likes/passes/saves/history entirely and
+# show the catalogue outfits exactly as scored by profile + occasion + situation.
+NEUTRAL_RECOMMENDATIONS = True
+LIKE_MSG = "Liked." if NEUTRAL_RECOMMENDATIONS else "Liked. We'll show you more like this."
+PASS_MSG = "Thanks for the feedback." if NEUTRAL_RECOMMENDATIONS else "Thanks. We'll steer away from that."
+
 def _secret(name):
     val = os.environ.get(name, "")
     if not val:
@@ -282,9 +288,40 @@ def _secret(name):
 
 def _online_query(outfit, gender=""):
     who = "women" if str(gender).lower().startswith("f") else "men"
-    top = outfit.get("top", "").replace(" over a white shirt", "")
-    bottom = outfit.get("bottom", "")
-    return [f"{who} outfit {top} {bottom}".strip(), f"{top} {bottom} outfit".strip(), f"{who} {top} outfit".strip()]
+    top, bottom, shoes = outfit.get("top", ""), outfit.get("bottom", ""), outfit.get("shoes", "")
+    return [f"{who} wearing {top} {bottom} {shoes} full outfit".strip(),
+            f"{who} outfit {top} with {bottom}".strip(),
+            f"{top} with {bottom} outfit".strip()]
+
+_STOP = {"a", "an", "the", "over", "with", "and", "of", "in", "for", "outfit", "look", "women", "men", "wearing", "full", "plain"}
+_SYN = {"trousers": "pants", "pant": "pants", "chinos": "pants", "churidar": "pants", "tshirt": "shirt",
+        "polo": "shirt", "oxford": "shirt", "kurta": "kurta", "jean": "jeans", "sneaker": "sneakers",
+        "shoe": "shoes", "loafer": "loafers", "boot": "boots"}
+
+def _toks(text):
+    text = str(text).lower().replace("t-shirt", "tshirt")
+    out = set()
+    for w in re.findall(r"[a-z]+", text):
+        if w in _STOP:
+            continue
+        w = _SYN.get(w, w)
+        if len(w) > 3 and w.endswith("s") and w not in ("pants", "jeans", "shoes", "boots", "sneakers", "loafers"):
+            w = w[:-1]
+        out.add(_SYN.get(w, w))
+    return out
+
+def _relevance(title, outfit):
+    """0..2 score: how much of the exact top and bottom description the photo title confirms."""
+    if not outfit:
+        return 2.0
+    t = _toks(title)
+    top = _toks(str(outfit.get("top", "")).split(" over ")[0])
+    bottom = _toks(outfit.get("bottom", ""))
+    if not t or not top:
+        return 0.0
+    tf = len(top & t) / len(top)
+    bf = len(bottom & t) / len(bottom) if bottom else 1.0
+    return tf + bf if tf >= 0.5 else 0.0
 
 def _search_photo_urls(query, n=3, errs=None):
     import requests
@@ -301,7 +338,8 @@ def _search_photo_urls(query, n=3, errs=None):
                 errs.append("Google: " + str(js["error"].get("message", "error"))[:80])
             for it in js.get("items", []):
                 urls = [it.get("link"), (it.get("image") or {}).get("thumbnailLink")]
-                out.append(([u for u in urls if u], f"Google Images · {it.get('displayLink') or 'web'}"))
+                out.append(([u for u in urls if u], f"Google Images · {it.get('displayLink') or 'web'}",
+                             f"{it.get('title', '')} {it.get('snippet', '')}"))
         except Exception as e:
             errs.append(f"Google: {type(e).__name__}")
     if len(out) < n:
@@ -313,7 +351,7 @@ def _search_photo_urls(query, n=3, errs=None):
             for it in DDGS().images(query, max_results=n * 3) or []:
                 urls = [u for u in (it.get("image"), it.get("thumbnail")) if u]
                 if urls:
-                    out.append((urls, f"Web image · {it.get('source') or 'search'}"))
+                    out.append((urls, f"Web image · {it.get('source') or 'search'}", it.get("title", "")))
         except Exception as e:
             errs.append(f"Web search: {type(e).__name__}")
     return out
@@ -332,9 +370,11 @@ def _download_image(urls, dest):
 
 def _meta_path(query):
     first = query[0] if isinstance(query, (list, tuple)) else query
-    return DEMO_CACHE_DIR / f"web_{hashlib.md5(first.encode()).hexdigest()[:12]}.json"
+    return DEMO_CACHE_DIR / f"web2_{hashlib.md5(first.encode()).hexdigest()[:12]}.json"
 
-def web_images(query, n=3):
+def web_images(query, n=3, outfit=None, min_score=1.2):
+    """Return photos whose titles confirm the exact described outfit. No close match -> no photo
+    (the card falls back to the colour palette) instead of showing a wrong outfit."""
     queries = list(query) if isinstance(query, (list, tuple)) else [query]
     meta = _meta_path(queries)
     if meta.exists():
@@ -343,19 +383,30 @@ def web_images(query, n=3):
             paths = [p for p in data.get("paths", []) if Path(p).exists()]
             if paths:
                 return paths, data.get("credits", [])
+            if not paths and time.time() - data.get("ts", 0) < 600:
+                return [], []
         except Exception:
             pass
-    paths, credits, errs = [], [], []
+    errs, cands, seen = [], [], set()
     for q in queries:
-        for urls, credit in _search_photo_urls(q, n, errs):
-            if len(paths) >= n:
-                break
-            f = meta.with_name(f"{meta.stem}_{len(paths)}.jpg")
-            if _download_image(urls, f):
-                paths.append(str(f)); credits.append(credit)
-        if paths:
+        for urls, credit, title in _search_photo_urls(q, n, errs):
+            key = urls[0] if urls else ""
+            if key in seen:
+                continue
+            seen.add(key)
+            sc = _relevance(title, outfit) if outfit else 1.0
+            if sc >= (min_score if outfit else 0):
+                cands.append((sc, urls, credit))
+    cands.sort(key=lambda c: -c[0])
+    paths, credits = [], []
+    for sc, urls, credit in cands[: n * 4]:
+        if len(paths) >= n:
             break
-    meta.write_text(json.dumps({"paths": paths, "credits": credits, "ts": time.time(), "err": ""}))
+        f = meta.with_name(f"{meta.stem}_{len(paths)}.jpg")
+        if _download_image(urls, f):
+            paths.append(str(f)); credits.append(credit)
+    err = "" if paths else ("; ".join(errs)[:160] or "no photo closely matched this exact outfit")
+    meta.write_text(json.dumps({"paths": paths, "credits": credits, "ts": time.time(), "err": err}))
     return paths, credits
 
 def miss_reason(query):
@@ -365,7 +416,7 @@ def miss_reason(query):
         return ""
 
 def online_images(outfit, gender="", n=3):
-    return web_images(_online_query(outfit, gender), n)
+    return web_images(_online_query(outfit, gender), n, outfit=outfit)
 
 def wardrobe_item_images(item, gender=""):
     who = "women" if str(gender).lower().startswith("f") else "men"
@@ -388,7 +439,10 @@ def _user_gender():
 
 def look_visual(look, image_path="", height=210):
     outfit = look.get("outfit", {})
-    caption = " · ".join(x for x in (look.get("occasion", ""), "Your wardrobe" if outfit.get("from_wardrobe") else "") if x)
+    occ_label = look.get("occasion", "")
+    if occ_label and outfit.get("occasions") and occ_label not in outfit["occasions"]:
+        occ_label = "Also worth a look"
+    caption = " · ".join(x for x in (occ_label, "Your wardrobe" if outfit.get("from_wardrobe") else "") if x)
     images = [image_path] if image_path and Path(image_path).exists() else outfit.get("images", [])
     if not images and not outfit.get("from_wardrobe"):
         images, _ = online_images(outfit, _user_gender())
@@ -658,15 +712,15 @@ SEASONS = ["Spring", "Summer", "Autumn", "Winter"]
 ALL_SEASONS = list(SEASONS)
 
 OUTFITS = [
-    {"name":"Classic Interview Look","top":"White formal shirt","bottom":"Navy tailored trousers","shoes":"Black formal shoes","accessories":["Minimal watch"],"colors":["White","Navy"],"styles":["Formal","Minimal"],"occasions":["Interview","Office"],"seasons":ALL_SEASONS,"formality":5,"trend":3,"fabric":"Crisp cotton poplin with a wool-blend trouser","fit":"Tailored through the shoulder, trouser breaks just above the shoe"},
-    {"name":"Smart College Look","top":"Light blue Oxford shirt","bottom":"Dark straight-fit jeans","shoes":"Clean white sneakers","accessories":["Watch"],"colors":["Blue","White"],"styles":["Smart Casual","Casual"],"occasions":["College","Casual outing"],"seasons":["Spring","Summer","Autumn"],"formality":3,"trend":4,"fabric":"Washed cotton Oxford with mid-weight denim","fit":"Shirt worn untucked or half-tucked, jeans straight not skinny"},
-    {"name":"Minimal Office Look","top":"Beige knit polo","bottom":"Charcoal trousers","shoes":"Brown loafers","accessories":["Leather belt"],"colors":["Beige","Grey","Brown"],"styles":["Smart Casual","Minimal"],"occasions":["Office","Date"],"seasons":["Autumn","Winter","Spring"],"formality":3.5,"trend":4,"fabric":"Fine-gauge merino knit with a matte wool trouser","fit":"Polo skims the waistband, no bunching at the hem"},
-    {"name":"Modern Party Look","top":"Black fitted shirt","bottom":"Black tailored trousers","shoes":"Black loafers","accessories":["Metal watch"],"colors":["Black"],"styles":["Trendy","Formal"],"occasions":["Party","Date"],"seasons":ALL_SEASONS,"formality":4,"trend":3,"fabric":"Soft satin-finish cotton with a drapey trouser","fit":"Slim through the torso, top button open"},
-    {"name":"Wedding Fusion Look","top":"Ivory kurta","bottom":"Beige trousers","shoes":"Brown ethnic loafers","accessories":["Watch"],"colors":["White","Beige","Brown"],"styles":["Traditional"],"occasions":["Wedding","Festival"],"seasons":["Autumn","Winter","Spring"],"formality":4,"trend":5,"fabric":"Cotton-silk kurta with a light cotton trouser","fit":"Kurta ends mid-thigh, trousers slim and tapered"},
-    {"name":"Casual Weekend Look","top":"Plain black T-shirt","bottom":"Blue jeans","shoes":"White sneakers","accessories":["Cap"],"colors":["Black","Blue","White"],"styles":["Casual","Streetwear"],"occasions":["Casual outing","College"],"seasons":["Spring","Summer"],"formality":1.5,"trend":2,"fabric":"Heavy cotton jersey with rigid denim","fit":"Relaxed, with a clean sleeve length at mid-bicep"},
-    {"name":"Linen Summer Date Look","top":"Light blue linen shirt","bottom":"Beige chinos","shoes":"Tan leather loafers","accessories":["Sunglasses"],"colors":["Blue","Beige","Brown"],"styles":["Smart Casual","Minimal"],"occasions":["Date","Casual outing","Wedding"],"seasons":["Summer","Spring"],"formality":3,"trend":4,"fabric":"Breathable linen with cotton twill chinos","fit":"Sleeves rolled twice, shirt loosely tucked"},
-    {"name":"Layered Winter Smart Look","top":"Grey crew-neck sweater over a white shirt","bottom":"Navy wool trousers","shoes":"Brown leather boots","accessories":["Wool scarf"],"colors":["Grey","White","Navy","Brown"],"styles":["Smart Casual","Minimal"],"occasions":["Office","College","Date"],"seasons":["Winter","Autumn"],"formality":3.5,"trend":3,"fabric":"Lambswool knit over cotton, brushed wool trouser","fit":"Shirt collar visible above the knit, trousers full length"},
-    {"name":"Festive Maroon Kurta Look","top":"Maroon kurta","bottom":"Cream churidar","shoes":"Tan mojari","accessories":["Pocket square"],"colors":["Maroon","White","Beige"],"styles":["Traditional","Trendy"],"occasions":["Festival","Wedding","Party"],"seasons":["Winter","Autumn"],"formality":4,"trend":4,"fabric":"Textured jacquard cotton with a soft churidar","fit":"Kurta cut straight, churidar gathers slightly at the ankle"},
+    {"name":"Classic Tailored Look","top":"White formal shirt","bottom":"Navy tailored trousers","shoes":"Black formal shoes","accessories":["Minimal watch"],"colors":["White","Navy"],"styles":["Formal","Minimal"],"occasions":["Interview","Office"],"seasons":ALL_SEASONS,"formality":5,"trend":3,"fabric":"Crisp cotton poplin with a wool-blend trouser","fit":"Tailored through the shoulder, trouser breaks just above the shoe"},
+    {"name":"Smart Oxford Look","top":"Light blue Oxford shirt","bottom":"Dark straight-fit jeans","shoes":"Clean white sneakers","accessories":["Watch"],"colors":["Blue","White"],"styles":["Smart Casual","Casual"],"occasions":["College","Casual outing"],"seasons":["Spring","Summer","Autumn"],"formality":3,"trend":4,"fabric":"Washed cotton Oxford with mid-weight denim","fit":"Shirt worn untucked or half-tucked, jeans straight not skinny"},
+    {"name":"Minimal Knit Look","top":"Beige knit polo","bottom":"Charcoal trousers","shoes":"Brown loafers","accessories":["Leather belt"],"colors":["Beige","Grey","Brown"],"styles":["Smart Casual","Minimal"],"occasions":["Interview","Office","Date"],"seasons":["Autumn","Winter","Spring"],"formality":3.5,"trend":4,"fabric":"Fine-gauge merino knit with a matte wool trouser","fit":"Polo skims the waistband, no bunching at the hem"},
+    {"name":"Modern Black Look","top":"Black fitted shirt","bottom":"Black tailored trousers","shoes":"Black loafers","accessories":["Metal watch"],"colors":["Black"],"styles":["Trendy","Formal"],"occasions":["Party","Date"],"seasons":ALL_SEASONS,"formality":4,"trend":3,"fabric":"Soft satin-finish cotton with a drapey trouser","fit":"Slim through the torso, top button open"},
+    {"name":"Ivory Fusion Look","top":"Ivory kurta","bottom":"Beige trousers","shoes":"Brown ethnic loafers","accessories":["Watch"],"colors":["White","Beige","Brown"],"styles":["Traditional"],"occasions":["Wedding","Festival"],"seasons":["Autumn","Winter","Spring"],"formality":4,"trend":5,"fabric":"Cotton-silk kurta with a light cotton trouser","fit":"Kurta ends mid-thigh, trousers slim and tapered"},
+    {"name":"Tee and Jeans Look","top":"Plain black T-shirt","bottom":"Blue jeans","shoes":"White sneakers","accessories":["Cap"],"colors":["Black","Blue","White"],"styles":["Casual","Streetwear"],"occasions":["Casual outing","College"],"seasons":["Spring","Summer"],"formality":1.5,"trend":2,"fabric":"Heavy cotton jersey with rigid denim","fit":"Relaxed, with a clean sleeve length at mid-bicep"},
+    {"name":"Linen Summer Look","top":"Light blue linen shirt","bottom":"Beige chinos","shoes":"Tan leather loafers","accessories":["Sunglasses"],"colors":["Blue","Beige","Brown"],"styles":["Smart Casual","Minimal"],"occasions":["Date","Casual outing","Wedding"],"seasons":["Summer","Spring"],"formality":3,"trend":4,"fabric":"Breathable linen with cotton twill chinos","fit":"Sleeves rolled twice, shirt loosely tucked"},
+    {"name":"Layered Winter Look","top":"Grey crew-neck sweater over a white shirt","bottom":"Navy wool trousers","shoes":"Brown leather boots","accessories":["Wool scarf"],"colors":["Grey","White","Navy","Brown"],"styles":["Smart Casual","Minimal"],"occasions":["Interview","Office","College","Date"],"seasons":["Winter","Autumn"],"formality":3.5,"trend":3,"fabric":"Lambswool knit over cotton, brushed wool trouser","fit":"Shirt collar visible above the knit, trousers full length"},
+    {"name":"Maroon Kurta Look","top":"Maroon kurta","bottom":"Cream churidar","shoes":"Tan mojari","accessories":["Pocket square"],"colors":["Maroon","White","Beige"],"styles":["Traditional","Trendy"],"occasions":["Festival","Wedding","Party"],"seasons":["Winter","Autumn"],"formality":4,"trend":4,"fabric":"Textured jacquard cotton with a soft churidar","fit":"Kurta cut straight, churidar gathers slightly at the ankle"},
     {"name":"Street Layer Look","top":"Oversized grey hoodie","bottom":"Black cargo pants","shoes":"Chunky white sneakers","accessories":["Crossbody bag"],"colors":["Grey","Black","White"],"styles":["Streetwear","Casual"],"occasions":["Casual outing","College","Party"],"seasons":["Autumn","Winter","Spring"],"formality":1,"trend":5,"fabric":"Brushed fleece with ripstop cotton","fit":"Boxy on top, tapered at the ankle to balance volume"},
 ]
 
@@ -677,6 +731,10 @@ HAIRSTYLES = [
     {"name":"Messy quiff","lengths":["Short","Medium"],"types":["Straight","Wavy"],"occasions":["Date","Party","College"],"tip":"Adds natural texture and volume."},
     {"name":"Slick back","lengths":["Short","Medium","Long"],"types":["Straight","Wavy"],"occasions":["Wedding","Party","Office"],"tip":"Refined formal presentation."},
 ]
+
+OCC_FORMALITY = {"Interview": 5, "Office": 3.5, "Wedding": 4, "Party": 3.5, "Date": 3, "College": 2.5,
+                 "Casual outing": 2, "Festival": 4}
+TRADITIONAL_OCCASIONS = ("Wedding", "Festival")
 
 FORMALITY = {"Formal": 5, "Traditional": 4, "Smart Casual": 3.5, "Minimal": 3, "Trendy": 2.5, "Casual": 2, "Streetwear": 1.5}
 NEUTRALS = {"Black", "White", "Grey", "Beige", "Navy", "Brown"}
@@ -714,6 +772,8 @@ def save_history(user_id, look):
     conn.close()
 
 def recent_occasion(user_id, default="Casual outing"):
+    if NEUTRAL_RECOMMENDATIONS:
+        return default
     conn = get_conn()
     rows = conn.execute("SELECT occasion FROM history WHERE user_id=? ORDER BY id DESC LIMIT 20", (user_id,)).fetchall()
     conn.close()
@@ -941,6 +1001,8 @@ def learn_preferences(user_id):
     return prefs
 
 def trending_counts():
+    if NEUTRAL_RECOMMENDATIONS:
+        return {}
     conn = get_conn()
     rows = conn.execute("SELECT look_json, action FROM feedback WHERE action IN ('like','save','generate') ORDER BY id DESC LIMIT 600").fetchall()
     conn.close()
@@ -1026,7 +1088,7 @@ def pick_hair(profile, occasion, seed, prefs):
     return best, why
 
 def build_look(outfit, profile, occasion, situation="", prefs=None, season=None, lead_reason=None):
-    prefs = prefs or empty_prefs()
+    prefs = empty_prefs() if NEUTRAL_RECOMMENDATIONS else (prefs or empty_prefs())
     score, reasons = 0.0, []
     if lead_reason:
         reasons.append(lead_reason)
@@ -1036,14 +1098,20 @@ def build_look(outfit, profile, occasion, situation="", prefs=None, season=None,
         reasons.append(f"Built for {occasion.lower()} dressing")
     else:
         score += 8
+    target = OCC_FORMALITY.get(occasion)
+    if target is not None and not outfit.get("from_wardrobe"):
+        gap = abs(outfit.get("formality", 3) - target)
+        score += max(0.0, 10 - 5 * gap)
+        if occasion not in outfit["occasions"]:
+            score -= 3 * gap   # padding outfits: the further from the occasion's dressiness, the lower
 
     matched_colors = [c for c in outfit.get("colors", []) if c in profile.get("preferred_colors", [])]
     if matched_colors:
-        score += min(8 * len(matched_colors), 16)
+        score += min(6 * len(matched_colors), 12)
         reasons.append("Uses colours you like: " + ", ".join(matched_colors))
     matched_styles = [s for s in outfit.get("styles", []) if s in profile.get("clothing_style", [])]
     if matched_styles:
-        score += min(8 * len(matched_styles), 16)
+        score += min(6 * len(matched_styles), 12)
         reasons.append("Matches your style: " + ", ".join(matched_styles))
 
     if season and season in outfit.get("seasons", []) and len(outfit.get("seasons", [])) < 4:
@@ -1068,20 +1136,19 @@ def build_look(outfit, profile, occasion, situation="", prefs=None, season=None,
         score += 5
         reasons.append("Layered for cooler weather")
 
-    # what this person has taught the app so far
+    # Gentle weight adjustments to prevent personal feedback from overriding core content relevance
     for c in outfit.get("colors", []):
         w = prefs["color"].get(c, 0)
-        score += _clamp(w * 3, -12, 12)
+        score += _clamp(w * 1.5, -4, 4)
         if w >= 1: reasons.append(f"You've liked {c.lower()} looks before")
-        elif w <= -1: reasons.append(f"Heads up: you've passed on {c.lower()} before")
     for s in styles:
         w = prefs["style"].get(s, 0)
-        score += _clamp(w * 3, -12, 12)
+        score += _clamp(w * 1.5, -4, 4)
         if w >= 1: reasons.append(f"You tend to like {s.lower()} styling")
-    score += _clamp(prefs["outfit"].get(outfit["name"], 0) * 4, -15, 15)
-    score += _clamp(prefs["occasion"].get(occasion, 0) * 2, -6, 0)
+    score += _clamp(prefs["outfit"].get(outfit["name"], 0) * 2, -5, 5)
+    score += _clamp(prefs["occasion"].get(occasion, 0) * 1, -3, 0)
     source = "My Wardrobe" if outfit.get("from_wardrobe") else "Online"
-    score += _clamp(prefs["source"].get(source, 0) * 1.5, -5, 5)
+    score += _clamp(prefs["source"].get(source, 0) * 1, -2, 2)
 
     if outfit.get("from_wardrobe"):
         score += outfit.get("wardrobe_score", 0)
@@ -1103,13 +1170,145 @@ def build_look(outfit, profile, occasion, situation="", prefs=None, season=None,
         "products": product_matches(outfit, profile, occasion) if source == "Online" else [],
     }
 
-def recommend(profile, occasion, situation, source="Online", wardrobe=None, prefs=None, user_id=None, limit=9, season=None):
+# ============================================================
+# GEMINI OUTFIT GENERATOR (text only - no images, no GPU)
+# ============================================================
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+_GEMINI_STYLES = sorted({st_ for o in OUTFITS for st_ in o.get("styles", [])})
+
+def _gemini_prompt(profile, occasion, situation, n, exclude, season):
+    who = {
+        "gender": profile.get("gender", ""), "age": profile.get("age", ""),
+        "height": profile.get("height", ""),
+        "favourite_colours": profile.get("preferred_colors", []),
+        "favourite_styles": profile.get("clothing_style", []),
+        "fashion_interests": profile.get("fashion_interests", ""),
+    }
+    avoid = f"\nDo NOT repeat or closely copy these outfits: {', '.join(exclude)}." if exclude else ""
+    return f"""You are a professional personal stylist. Create {n} DIFFERENT complete outfits.
+
+CLIENT: {json.dumps(who)}
+OCCASION: {occasion}
+EXTRA CONTEXT: {situation or "none"}
+CURRENT SEASON: {season or "any"}{avoid}
+
+Rules:
+- Every outfit must suit the occasion and mostly use the client's favourite colours and styles, with some variety.
+- The outfit "name" must describe the clothes only (for example "Navy Linen Look"). Never put an occasion (interview, college, office, wedding, party, date, festival, casual outing) in the name.
+- Name every garment specifically (colour + garment + cut), so it can be drawn exactly. No brand names.
+- "colors" must be plain colour words (e.g. Navy, White, Beige). "styles" must only use: {", ".join(_GEMINI_STYLES)}.
+- "formality" is 1 (very casual) to 5 (very formal). "trend" is 1 to 5.
+- "seasons" may only use: {", ".join(SEASONS)}.
+
+Return ONLY a JSON array. Each item has exactly these keys:
+name, top, bottom, shoes, accessories (array of strings), colors (array), styles (array),
+seasons (array), formality (number), trend (number), fabric, fit"""
+
+def _gemini_model(key):
+    """Use GEMINI_MODEL if set; otherwise ask Google which models this key can use."""
+    forced = _secret("GEMINI_MODEL")
+    if forced:
+        return forced
+    if st.session_state.get("gemini_model"):
+        return st.session_state["gemini_model"]
+    import requests
+    r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                     headers={"x-goog-api-key": key}, params={"pageSize": 200}, timeout=20)
+    if r.status_code != 200:
+        try: msg = r.json()["error"]["message"]
+        except Exception: msg = r.text[:150]
+        raise RuntimeError(f"Google rejected the key (HTTP {r.status_code}): {msg[:150]}")
+    names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+             if "generateContent" in m.get("supportedGenerationMethods", [])]
+    for pref in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest", "gemini-1.5-flash"):
+        if pref in names:
+            st.session_state["gemini_model"] = pref
+            return pref
+    flash = [n_ for n_ in names if "flash" in n_ and not any(x in n_ for x in ("lite", "image", "tts", "live", "preview", "exp"))]
+    if flash:
+        st.session_state["gemini_model"] = sorted(flash)[-1]
+        return st.session_state["gemini_model"]
+    raise RuntimeError("No Gemini text model is available for this key")
+
+def gemini_outfits(profile, occasion, situation="", n=9, exclude=None, season=None):
+    """Ask Gemini for outfits. Returns a list of outfit dicts (same shape as OUTFITS),
+    or [] if the key is missing or the call fails, so the caller can fall back."""
+    key = _secret("GEMINI_API_KEY")
+    if not key:
+        st.session_state["gemini_error"] = "GEMINI_API_KEY not found"
+        return []
+    import requests
+    try:
+        model = _gemini_model(key)
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": _gemini_prompt(profile, occasion, situation, n, exclude or [], season)}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9},
+            },
+            timeout=60,
+        )
+        if r.status_code != 200:
+            try: msg = r.json()["error"]["message"]
+            except Exception: msg = r.text[:150]
+            st.session_state.pop("gemini_model", None)
+            raise RuntimeError(f"{model}: HTTP {r.status_code}: {msg[:150]}")
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+        raw = json.loads(text)
+    except Exception as e:
+        st.session_state["gemini_error"] = str(e)[:220]
+        return []
+
+    out, seen = [], {n_.lower() for n_ in (exclude or [])}
+    for o in raw if isinstance(raw, list) else []:
+        try:
+            name = str(o["name"]).strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            seasons = [x for x in o.get("seasons", []) if x in SEASONS] or ALL_SEASONS
+            out.append({
+                "name": name, "top": str(o["top"]), "bottom": str(o["bottom"]), "shoes": str(o["shoes"]),
+                "accessories": [str(a) for a in o.get("accessories", [])][:3],
+                "colors": [str(c).title() for c in o.get("colors", [])][:4],
+                "styles": [x for x in o.get("styles", []) if x in _GEMINI_STYLES][:3] or ["Smart Casual"],
+                "occasions": [occasion], "seasons": seasons,
+                "formality": float(_clamp(float(o.get("formality", 3)), 1, 5)),
+                "trend": float(_clamp(float(o.get("trend", 3)), 1, 5)),
+                "fabric": str(o.get("fabric", "")), "fit": str(o.get("fit", "")),
+                "ai_generated": True,
+            })
+        except Exception:
+            continue
+    return out
+
+
+def recommend(profile, occasion, situation, source="Online", wardrobe=None, prefs=None, user_id=None, limit=9, season=None, exclude=None):
     pool = []
     if source in ("Online", "Both"):
-        pool += OUTFITS
+        ai = gemini_outfits(profile, occasion, situation, n=limit or 9, exclude=exclude, season=season)
+        # Gemini first; the built-in catalogue is only the fallback if Gemini is unavailable
+        if ai:
+            pool += ai
+        else:
+            fresh = [o for o in OUTFITS if o["name"] not in (exclude or [])]
+            fit = [o for o in fresh if occasion in o.get("occasions", [])]
+            # Occasion-fit outfits first, then every other outfit ordered by closest formality,
+            # so "Show more looks" always has something to reveal for every occasion.
+            ref = sum(o.get("formality", 3) for o in fit) / len(fit) if fit else 3
+            ref = OCC_FORMALITY.get(occasion, ref)
+            rest = [o for o in fresh if o not in fit
+                    and (occasion in TRADITIONAL_OCCASIONS or "Traditional" not in o.get("styles", []))]
+            rest.sort(key=lambda o: abs(o.get("formality", 3) - ref))
+            pool += fit + rest
     if source in ("My Wardrobe", "Both"):
         pool += build_wardrobe_outfits(wardrobe or [], occasion)
-    prefs = prefs if prefs is not None else learn_preferences(user_id)
+    if NEUTRAL_RECOMMENDATIONS:
+        prefs = empty_prefs()
+    else:
+        prefs = prefs if prefs is not None else learn_preferences(user_id)
     looks = [build_look(o, profile, occasion, situation, prefs, season) for o in pool]
     looks.sort(key=lambda x: (-x["score"], x["outfit"]["name"]))
     return prefetch_online_images(looks[:limit], profile.get("gender", ""))
@@ -1120,7 +1319,7 @@ def trending_looks(profile, prefs, n=3):
     out = []
     for o in ranked:
         c = counts.get(o["name"], 0)
-        lead = f"{c} saves and likes from people using this app" if c >= 3 else "An editor's pick that keeps coming up this season"
+        lead = f"{c} saves and likes from people using this app" if (c >= 3 and not NEUTRAL_RECOMMENDATIONS) else "An editor's pick that keeps coming up this season"
         out.append(build_look(o, profile, o["occasions"][0], "", prefs, None, lead_reason=lead))
     return prefetch_online_images(out, profile.get("gender", ""))
 
@@ -1164,22 +1363,9 @@ def product_matches(outfit, profile, occasion):
 # ============================================================
 # FLUX.1 KONTEXT - FREE HUGGING FACE ZEROGPU SPACE
 # ============================================================
-
-# FLUX.1 Kontext is an image-editing model: it accepts the user's
-# profile photo plus a natural-language styling instruction.
-# The public Hugging Face Space exposes an /infer endpoint.
 FLUX_SPACE_ID = "black-forest-labs/FLUX.1-Kontext-Dev"
 
-
 def generate_ai_look(profile, look, user_id=None, extra_prompt=""):
-    """
-    Generate an AI-styled preview from the user's profile photo.
-
-    This is image editing / styling, not a specialized garment VTON
-    model. The prompt asks FLUX Kontext to preserve the person while
-    changing the outfit and hairstyle.
-    """
-
     profile_photo = profile.get("profile_photo")
     if not profile_photo or not Path(profile_photo).exists():
         raise RuntimeError(
@@ -1196,42 +1382,32 @@ def generate_ai_look(profile, look, user_id=None, extra_prompt=""):
     outfit = look.get("outfit", {})
     hair = look.get("hairstyle", {})
 
+    acc = ", ".join(outfit.get("accessories", []))
     prompt = f"""
-Edit the uploaded photo of the same person into this complete fashion look.
+Edit the uploaded photo: completely replace the person's current clothing with the exact outfit below.
 
 PERSON PRESERVATION:
-- Keep the same person and preserve identity and facial features.
-- Preserve skin tone, body proportions, pose, hairstyle characteristics,
-  hands, and overall appearance as much as possible.
-- Keep exactly one person.
-- Keep the original full-body composition whenever possible.
+- Keep the same person: identical face, identity, skin tone, body proportions and pose.
+- Keep exactly one person and the original full-body framing and background.
 - Do not replace the person with a different model.
 
-OUTFIT:
-Top: {outfit.get("top", "")}
-Bottom: {outfit.get("bottom", "")}
-Shoes: {outfit.get("shoes", "")}
-Accessories: {", ".join(outfit.get("accessories", []))}
-Colors: {", ".join(outfit.get("colors", []))}
-Style: {", ".join(outfit.get("styles", []))}
+EXACT OUTFIT (every garment must match this description literally):
+- Upper body: {outfit.get("top", "")}.
+- Lower body: {outfit.get("bottom", "")}.
+- Footwear: {outfit.get("shoes", "")}.
+{f"- Accessories: {acc}." if acc else ""}
+- Garment colours must be exactly as named above; do not substitute, add or mix other colours.
+- Fabric: {outfit.get("fabric", "")}. Fit: {outfit.get("fit", "")}.
+- No other clothing items, layers, patterns, prints or logos beyond what is listed.
+- Show the full outfit from head to toe so the top, bottom and shoes are all clearly visible.
 
-HAIRSTYLE:
-{hair.get("name", "")}
+HAIRSTYLE: {hair.get("name", "")}.
+OCCASION: {look.get("occasion", "")}. {look.get("situation", "")}
 
-OCCASION:
-{look.get("occasion", "")}
-
-SITUATION:
-{look.get("situation", "")}
-
-Make the selected clothing clearly visible and realistic.
-Use realistic fabric, natural folds, believable fit, realistic anatomy,
-natural lighting and a polished fashion-editorial appearance.
-
-Do not add another person, text, logos, watermarks, or unrelated objects.
+Realistic fabric, natural folds, believable fit, realistic anatomy, natural lighting.
+Do not add another person, text, watermarks or unrelated objects.
 """
 
-    # Optional note typed by the user on the AI Stylist page.
     extra_prompt = (extra_prompt or "").strip()[:300]
     if extra_prompt:
         prompt += f"\nADDITIONAL STYLING NOTES FROM THE USER:\n{extra_prompt}\n"
@@ -1243,9 +1419,6 @@ Do not add another person, text, logos, watermarks, or unrelated objects.
             verbose=False,
         )
 
-        # The official Space uses:
-        # infer(input_image, prompt, seed, randomize_seed,
-        #       guidance_scale, steps)
         result = client.predict(
             handle_file(profile_photo),
             prompt,
@@ -1256,7 +1429,6 @@ Do not add another person, text, logos, watermarks, or unrelated objects.
             api_name="/infer",
         )
 
-        # The Space returns: result image, seed, reuse-button state.
         result_image = result[0] if isinstance(result, (list, tuple)) else result
 
         if not result_image:
@@ -1265,7 +1437,6 @@ Do not add another person, text, logos, watermarks, or unrelated objects.
                 "may currently be busy or rate-limited."
             )
 
-        # Gradio normally returns a local filepath for an Image output.
         if isinstance(result_image, dict):
             result_path = (
                 result_image.get("path")
@@ -1294,7 +1465,6 @@ Do not add another person, text, logos, watermarks, or unrelated objects.
             out_path.write_bytes(response.content)
 
         else:
-            # Some Gradio versions may return a PIL image.
             try:
                 from PIL import Image
                 if isinstance(result_image, Image.Image):
@@ -1318,36 +1488,25 @@ Do not add another person, text, logos, watermarks, or unrelated objects.
 
     except Exception as e:
         message = str(e)
-
         if "upstream Gradio app has raised an exception" in message:
             raise RuntimeError(
                 "The FLUX public ZeroGPU server rejected the request or is busy. "
                 "Please try again after a short wait."
             ) from e
-
         raise RuntimeError(
             f"FLUX.1 Kontext generation failed: {message}"
         ) from e
 
 
-
 # ============================================================
 # VIRTUAL TRY-ON - GPU BACKEND ON GOOGLE COLAB (IDM-VTON)
 # ============================================================
-# Run the companion notebook (AIStylist_TryOn_Colab.ipynb) in Google Colab. It prints a
-# public URL (https://xxxx.gradio.live). Put it in .streamlit/secrets.toml as
-#     TRYON_URL = "https://xxxx.gradio.live"
-# or set the TRYON_URL environment variable. If TRYON_URL is empty, the public
-# IDM-VTON Hugging Face Space is used instead (same API, but shared and often busy).
 TRYON_SPACE_ID = "yisol/IDM-VTON"
-
 
 def tryon_endpoint():
     return (_secret("TRYON_URL") or "").strip().rstrip("/") or TRYON_SPACE_ID
 
-
 def generate_tryon(person_path, garment_path, garment_desc="", user_id=None, name="Virtual try-on"):
-    """Dress the person in the chosen garment photo using IDM-VTON. Returns the saved image path."""
     if not person_path or not Path(person_path).exists():
         raise RuntimeError("Please choose or take a full-body photo of yourself first.")
     if not garment_path or not Path(garment_path).exists():
@@ -1359,16 +1518,14 @@ def generate_tryon(person_path, garment_path, garment_desc="", user_id=None, nam
 
     try:
         client = Client(tryon_endpoint(), httpx_kwargs={"timeout": 900}, verbose=False)
-        # IDM-VTON: tryon(person_editor_dict, garment_image, garment_description,
-        #                 auto_mask, auto_crop, denoise_steps, seed) -> (result, masked_person)
         result = client.predict(
             {"background": handle_file(person_path), "layers": [], "composite": None},
             handle_file(garment_path),
             (garment_desc or "a garment").strip()[:120],
-            True,      # auto-generate the clothing mask
-            False,     # no auto-crop, keep the original framing
-            30,        # denoise steps
-            42,        # seed
+            True,
+            False,
+            30,
+            42,
             api_name="/tryon",
         )
         result_image = result[0] if isinstance(result, (list, tuple)) else result
@@ -1392,7 +1549,7 @@ def generate_tryon(person_path, garment_path, garment_desc="", user_id=None, nam
 # ============================================================
 
 for _k, _v in {
-    "user_id": None, "username": None, "looks": [], "looks_shown": 3, "selected_look": None,
+    "user_id": None, "username": None, "looks": [], "looks_brief": None, "looks_shown": 3, "selected_look": None,
     "last_result": None, "gen_error": None, "pending_save": None, "studio_prompt": "",
     "retry_pid": None, "nav_page": "Home", "home_tick": 0,
     "tryon_result": None, "tryon_error": None,
@@ -1407,7 +1564,6 @@ def toast(msg):
 
 def go(page_name):
     st.session_state.nav_page = page_name
-    # This callback runs before the next script pass, so widget state is safe to update.
     st.session_state.nav_page_bottom = page_name
 
 def _sync_nav_from_widget():
@@ -1444,7 +1600,6 @@ def cb_request_save(look, image_path):
 
 
 def look_card(look, key, compact=False, show_select=True):
-    """One look: visual tile, smart details, 'Why this look?', shop links and actions."""
     outfit = look["outfit"]
     hair = look.get("hairstyle", {})
     match = int(_clamp(round(look.get("score", 0)), 35, 98))
@@ -1454,7 +1609,7 @@ def look_card(look, key, compact=False, show_select=True):
             _, _credits = online_images(outfit, _user_gender())
             if not _credits:
                 _why = miss_reason(_online_query(outfit, _user_gender()))
-                st.caption(f"No photo loaded: {_why or 'searching...'}")
+                st.caption(f"No exact photo found, showing the colour palette. ({_why or 'searching...'})")
             _more = f"https://www.pinterest.com/search/pins/?q={quote_plus(_online_query(outfit, _user_gender())[0])}"
             st.markdown(f'<div class="small-muted">{_esc(_credits[0]) + " · " if _credits and not compact else ""}'
                         f'<a href="{_esc(_more)}" target="_blank" rel="noopener noreferrer">More photos</a></div>',
@@ -1512,12 +1667,12 @@ def look_card(look, key, compact=False, show_select=True):
             with a:
                 st.markdown('<span class="act-marker"></span>', unsafe_allow_html=True)
                 st.button("Like", key=f"{key}_like", on_click=cb_feedback,
-                          args=(user_id, look, "like", None, "Liked. We'll show you more like this."), use_container_width=True)
+                          args=(user_id, look, "like", None, LIKE_MSG), use_container_width=True)
             with b:
                 with _popover("Pass"):
                     st.radio("What didn't work?", DISLIKE_REASONS, key=f"{key}_why")
                     st.button("Send feedback", key=f"{key}_pass", on_click=cb_feedback,
-                              args=(user_id, look, "dislike", f"{key}_why", "Thanks. We'll steer away from that."))
+                              args=(user_id, look, "dislike", f"{key}_why", PASS_MSG))
             with c:
                 st.button("Save", key=f"{key}_save", on_click=cb_quick_save, args=(user_id, look), use_container_width=True)
             if show_select:
@@ -1525,7 +1680,6 @@ def look_card(look, key, compact=False, show_select=True):
 
 
 def render_save_confirm(uid, scope):
-    """Generated looks are only saved after the user confirms the collection."""
     ps = st.session_state.get("pending_save")
     if not ps:
         return
@@ -1563,8 +1717,6 @@ if not st.session_state.user_id:
     AUTH_MAX_TRIES, AUTH_LOCK_SECONDS = 5, 30
 
     def _landing_wall():
-        """Masonry of looks. Uses photos already cached on disk (no network on the sign-in page),
-        mixed with colour-board tiles built from the built-in outfits."""
         heights = [250, 330, 220, 300, 260, 340, 230, 290, 320, 240, 280, 310]
         photos = sorted(DEMO_CACHE_DIR.glob("web_*_*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)[:8]
         tiles, i = [], 0
@@ -1592,7 +1744,7 @@ if not st.session_state.user_id:
     """, unsafe_allow_html=True)
 
     try:
-        auth_box = st.container(key="auth_float")      # needs Streamlit 1.39+; older versions show a plain card
+        auth_box = st.container(key="auth_float")
     except TypeError:
         auth_box = st.container(border=True)
 
@@ -1631,11 +1783,13 @@ if not st.session_state.user_id:
 
         with register_tab:
             ru = st.text_input("Choose a username", key="reg_user", placeholder="3 to 24 letters, numbers, _ or .")
+            rm = st.text_input("Email", key="reg_email", placeholder="you@example.com")
             rp = st.text_input("Choose a password", type="password", key="reg_pw", placeholder="at least 6 characters")
             rc = st.text_input("Confirm password", type="password", key="reg_pw2", placeholder="type it again")
 
             user_ok = bool(re.fullmatch(r"[a-z0-9_.]{3,24}", ru.strip().lower()))
             len_ok = len(rp) >= 6
+            email_ok = is_valid_email(rm.strip())
             match_ok = bool(rp) and rp == rc
             variety = sum([bool(re.search(r"[a-z]", rp)) and bool(re.search(r"[A-Z]", rp)),
                            bool(re.search(r"\d", rp)), bool(re.search(r"[^A-Za-z0-9]", rp)), len(rp) >= 10])
@@ -1649,14 +1803,15 @@ if not st.session_state.user_id:
             def _chk(ok, text):
                 return f'<span class="{"ok" if ok else ""}">{"✓" if ok else "○"} {text}</span>'
             st.markdown('<div class="auth-checks">' + _chk(user_ok, "Username: 3 to 24 letters, numbers, _ or .")
+                        + _chk(email_ok, "A valid email address")
                         + _chk(len_ok, "Password: at least 6 characters")
                         + _chk(match_ok, "Both passwords match") + '</div>', unsafe_allow_html=True)
 
             if st.button("Create account", type="primary", use_container_width=True, key="reg_go",
-                         disabled=not (user_ok and len_ok and match_ok)):
-                ok, msg = register(ru, re, rp)
+                         disabled=not (user_ok and email_ok and len_ok and match_ok)):
+                ok, msg = register(ru, rm, rp)
                 if ok:
-                    user = login(ru, rp)          # sign them straight in, onboarding starts next
+                    user = login(ru, rp)
                     if user:
                         st.session_state.user_id = user["id"]
                         st.session_state.username = user["username"]
@@ -1674,7 +1829,7 @@ if not st.session_state.user_id:
 user_id = st.session_state.user_id
 username = st.session_state.username
 raw_profile = get_profile(user_id)
-has_profile = bool(raw_profile)      # parse_profile() always returns a dict, so test the raw row
+has_profile = bool(raw_profile)
 profile = parse_profile(raw_profile)
 ensure_default_collection(user_id)
 prefs = learn_preferences(user_id)
@@ -1695,11 +1850,9 @@ with tb_r:
     tc2.button("Log out", key="logout_top_2", on_click=do_logout, use_container_width=True)
 
 if not has_profile:
-    st.session_state.nav_page = "Profile"   # new users start with guided onboarding
+    st.session_state.nav_page = "Profile"
 if st.session_state.nav_page not in NAV:
     st.session_state.nav_page = "Home"
-# Page actions (such as onboarding completion) may request navigation after the
-# previous widget was rendered. Reconcile before creating the widget on this run.
 st.session_state.setdefault("nav_page_bottom", st.session_state.nav_page)
 if st.session_state.nav_page_bottom != st.session_state.nav_page:
     st.session_state.nav_page_bottom = st.session_state.nav_page
@@ -1715,7 +1868,7 @@ if _msg:
 
 
 # ============================================================
-# FLUX RUNNER (failure keeps the look so the user can retry later)
+# FLUX RUNNER
 # ============================================================
 
 def run_generation(look, extra_prompt="", pending_id=None):
@@ -1730,7 +1883,7 @@ def run_generation(look, extra_prompt="", pending_id=None):
             pending_id = add_pending(user_id, look, extra_prompt, e)
         st.session_state.gen_error = {"msg": str(e), "pending_id": pending_id}
         return None
-    for p in get_pending(user_id):               # a success clears any retry entry for this look
+    for p in get_pending(user_id):
         if p["look"].get("outfit", {}).get("name") == look.get("outfit", {}).get("name"):
             delete_pending(p["id"], user_id)
     save_feedback(user_id, look, "generate")
@@ -1768,8 +1921,7 @@ def page_home():
         st.info(f"You have {len(pending)} AI preview{'s' if len(pending) > 1 else ''} waiting to be retried. Your selected look is saved.")
         st.button("Open AI Stylist to retry", key="home_retry", on_click=go, args=("AI Stylist",))
 
-    # ---- Personalized -------------------------------------------------
-    section_title("Picked for you", "Based on your profile, your wardrobe and everything you've liked or passed on.")
+    section_title("Picked for you", "Based on your profile, your wardrobe and related styling context.")
     st.session_state.setdefault("home_occ", recent_occasion(user_id))
     c1, c2 = st.columns([2, 1])
     occ = c1.selectbox("Dressing for", OCCASIONS, key="home_occ")
@@ -1789,14 +1941,12 @@ def page_home():
         with col:
             look_card(look, f"home_p{i}")
 
-    # ---- Trending -----------------------------------------------------
-    section_title("Trending now", "What people using Stylist Buddy are liking and saving.")
+    section_title("Trending now", "Editor's picks this season." if NEUTRAL_RECOMMENDATIONS else "What people using Stylist Buddy are liking and saving.")
     cols = st.columns(3, gap="medium")
     for i, (look, col) in enumerate(zip(trending_looks(profile, prefs), cols)):
         with col:
             look_card(look, f"home_t{i}", compact=True)
 
-    # ---- Seasonal -----------------------------------------------------
     section_title("The seasonal edit", "Fabrics and layers that suit the weather.")
     st.session_state.setdefault("home_season", season)
     sel_season = st.radio("Season", SEASONS, key="home_season", horizontal=True, label_visibility="collapsed")
@@ -1805,7 +1955,6 @@ def page_home():
         with col:
             look_card(look, f"home_s{i}", compact=True)
 
-    # ---- Recent saved looks -------------------------------------------
     section_title("Recently saved", "Your latest saved looks.")
     saved = get_saved_looks(user_id, limit=4)
     if not saved:
@@ -1849,7 +1998,6 @@ def page_wardrobe():
         st.info("Your wardrobe is empty. Add a top, a bottom and a pair of shoes to unlock outfit matches.")
         return
 
-    # ---- Smart matches (local) --------------------------------------
     counts = {c: sum(1 for i in items if i.get("category") == c) for c in ("Top", "Bottom", "Shoes")}
     section_title("Smart matches", "Outfits built from your own pieces, scored for colour, dressiness and occasion.")
     if all(counts.values()):
@@ -1863,7 +2011,6 @@ def page_wardrobe():
         missing = [c.lower() for c, n in counts.items() if n == 0]
         st.info("Add at least one " + " and one ".join(missing) + " to see matches.")
 
-    # ---- Grid with filter chips -------------------------------------
     section_title("All pieces")
     cats = ["All"] + sorted({i["category"] for i in items if i.get("category")})
     cat_filter = st.radio("Category", cats, horizontal=True, key="ward_cat", label_visibility="collapsed")
@@ -1900,7 +2047,6 @@ def page_wardrobe():
 def page_stylist():
     page_header("AI Stylist", "Tell us the occasion. Pick a look. Preview it on yourself.")
 
-    # ---- 1. Brief -----------------------------------------------------
     with st.container(border=True):
         st.markdown('<div class="step-title">Your brief</div><div class="step-desc">Looks are curated on your device. AI is only used for the final preview.</div>', unsafe_allow_html=True)
         c1, c2 = st.columns(2)
@@ -1917,13 +2063,17 @@ def page_stylist():
             else:
                 if need_ward and not has_all:
                     st.caption("Your wardrobe doesn't have a full outfit yet, so these come from online picks.")
-                looks = recommend(profile, occasion, situation, source, wardrobe, prefs, user_id, limit=9, season=current_season())
+                st.session_state.pop("gemini_error", None)
+                with st.spinner("Your stylist is curating looks..."):
+                    looks = recommend(profile, occasion, situation, source, wardrobe, prefs, user_id, limit=9, season=current_season())
                 st.session_state.looks = looks
+                st.session_state.looks_brief = dict(occasion=occasion, situation=situation, source=source)
                 st.session_state.looks_shown = 3
+                if st.session_state.get("gemini_error") and source in ("Online", "Both"):
+                    st.caption("AI stylist was unavailable, so these come from the built-in collection. (" + st.session_state["gemini_error"] + ")")
                 for lk in looks[:3]:
                     save_history(user_id, lk)
 
-    # ---- 2. Looks (3 first, more on request) --------------------------
     looks = st.session_state.looks
     if looks:
         section_title("Your looks", "Pick the one you want to see on yourself.")
@@ -1933,12 +2083,21 @@ def page_stylist():
             for j, (look, col) in enumerate(zip(row, cols)):
                 with col:
                     look_card(look, f"st{r * 3 + j}")
-        if len(looks) > st.session_state.looks_shown:
+        brief = st.session_state.get("looks_brief") or {}
+        can_fetch_more = brief.get("source") in ("Online", "Both") and any(l["outfit"].get("ai_generated") for l in looks)
+        if len(looks) > st.session_state.looks_shown or can_fetch_more:
             if st.button("Show more looks", key="more_looks"):
+                if len(looks) <= st.session_state.looks_shown and can_fetch_more:
+                    with st.spinner("Finding more looks for you..."):
+                        more = recommend(profile, brief["occasion"], brief["situation"], "Online", None, prefs, user_id,
+                                         limit=6, season=current_season(), exclude=[l["outfit"]["name"] for l in looks])
+                    looks.extend(more)
+                    st.session_state.looks = looks
+                    if not more:
+                        st.toast("No new looks came back. Try again in a moment.")
                 st.session_state.looks_shown += 3
                 st.rerun()
 
-    # ---- 3. Studio: selected look -> optional prompt -> FLUX ----------
     sel = st.session_state.selected_look
     if sel:
         section_title("Preview on you", "FLUX edits your profile photo into this look.")
@@ -1989,7 +2148,6 @@ def page_stylist():
                 st.markdown('<div class="ba-placeholder">Generate a preview to see yourself in this look.</div>', unsafe_allow_html=True)
         render_save_confirm(user_id, "stylist")
 
-    # ---- 4. Saved for retry -------------------------------------------
     pending = get_pending(user_id)
     if pending:
         section_title("Saved for retry", "Previews that didn't finish. The public FLUX server can be busy, so try again in a few minutes.")
@@ -2020,7 +2178,6 @@ def page_tryon():
 
     c1, c2 = st.columns(2, gap="large")
 
-    # ---- You ----------------------------------------------------------
     with c1:
         with st.container(border=True):
             st.markdown('<div class="step-title">1. You</div><div class="step-desc">Stand straight, good light, plain background, upper body clearly visible.</div>', unsafe_allow_html=True)
@@ -2041,7 +2198,6 @@ def page_tryon():
                     person_path = save_upload(up, f"tryon_person_{user_id}")
                     st.image(person_path, use_container_width=True)
 
-    # ---- Garment ------------------------------------------------------
     with c2:
         with st.container(border=True):
             st.markdown('<div class="step-title">2. The garment</div><div class="step-desc">Works best with tops, shirts, jackets and dresses on a plain background.</div>', unsafe_allow_html=True)
@@ -2291,6 +2447,9 @@ def onboarding():
 def taste_panel():
     st.markdown('<div class="step-title">What we have learned about your taste</div>'
                 '<div class="step-desc">Built on this device from your likes, passes, saves and previews. Recent actions count more.</div>', unsafe_allow_html=True)
+    if NEUTRAL_RECOMMENDATIONS:
+        st.info("Recommendations currently ignore your history and show the exact looks for your profile and occasion.")
+        return
     if not prefs["n"]:
         st.info("Nothing yet. Like or pass on a few looks and this fills in.")
         return
